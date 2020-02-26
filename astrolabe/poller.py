@@ -12,34 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utilities for polling a set of entities."""
+
 from time import sleep
 
 from astrolabe.exceptions import PollingTimeoutError
 from astrolabe.utils import Timer
 
 
-class SelectBase:
+class PollerBase:
+    """Base class for implementing a poller."""
     def __init__(self, *, frequency, timeout):
         self.interval = 1.0 / frequency
         self.timeout = timeout
 
     @staticmethod
-    def poll(obj, attribute, args, kwargs):
+    def _check_ready(obj, attribute, args, kwargs):
+        """Abstract method that defines the readiness check used during
+        polling."""
         raise NotImplementedError
 
-    def select(self, objects, *, attribute, args, kwargs):
+    def poll(self, objects, *, attribute, args, kwargs):
+        """Wait for a member of `objects` to become ready. Once a member
+        is ready, return it to the caller. The values of `attribute`,
+        `args` and `kwargs` depends on the readiness check employed by the
+        implementation."""
         timer = Timer()
         timer.start()
         while timer.elapsed < self.timeout:
             for obj in objects:
-                return_value = self.poll(obj, attribute, args, kwargs)
+                return_value = self._check_ready(obj, attribute, args, kwargs)
                 if return_value:
                     return obj
             sleep(self.interval)
         raise PollingTimeoutError
 
 
-class BooleanCallableSelector(SelectBase):
+class BooleanCallablePoller(PollerBase):
+    """A poller that selects objects based on the boolean return value of one
+    its methods."""
     @staticmethod
-    def poll(obj, attribute, args=(), kwargs={}):
+    def _check_ready(obj, attribute, args=(), kwargs={}):
+        """A readiness check that evaluates to True if the `attribute`
+        method of the `obj` object returns boolean True when called with
+        the provided args and kwargs."""
         return bool(getattr(obj, attribute)(*args, **kwargs))

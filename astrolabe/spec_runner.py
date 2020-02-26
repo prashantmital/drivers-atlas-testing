@@ -31,7 +31,7 @@ from astrolabe.commands import (
     get_one_organization_by_name, ensure_project, ensure_admin_user,
     ensure_connect_from_anywhere)
 from astrolabe.exceptions import AstrolabeTestCaseError
-from astrolabe.poller import BooleanCallableSelector
+from astrolabe.poller import BooleanCallablePoller
 from astrolabe.utils import (
     assert_subset, cached_property, encode_cdata, SingleTestXUnitLogger,
     Timer)
@@ -187,11 +187,11 @@ class AtlasTestCase:
         print("Waiting for maintenance to complete.")
 
         # Step-4: wait until maintenance completes (cluster is IDLE).
-        selector = BooleanCallableSelector(
+        selector = BooleanCallablePoller(
             frequency=self.config.polling_frequency,
             timeout=self.config.polling_timeout)
-        selector.select([self], attribute="is_cluster_state", args=("IDLE",),
-                        kwargs={})
+        selector.poll([self], attribute="is_cluster_state", args=("IDLE",),
+                      kwargs={})
         self.verify_cluster_configuration_matches("final")
 
         # Step-5: interrupt driver workload and capture streams
@@ -311,11 +311,11 @@ class SpecTestRunnerBase:
         # Step-2: run tests round-robin until all have been run.
         remaining_test_cases = self.cases.copy()
         while remaining_test_cases:
-            selector = BooleanCallableSelector(
+            selector = BooleanCallablePoller(
                 frequency=self.config.polling_frequency,
                 timeout=self.config.polling_timeout)
             # Select a case whose cluster is ready.
-            active_case = selector.select(
+            active_case = selector.poll(
                 remaining_test_cases, attribute="is_cluster_state",
                 args=("IDLE",), kwargs={})
             # Run the case.
