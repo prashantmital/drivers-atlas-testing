@@ -16,7 +16,7 @@ from collections import namedtuple
 
 from atlasclient.utils import JSONObject
 
-CONFIG_DEFAULTS = JSONObject({
+CONFIG_DEFAULTS = JSONObject.from_dict({
     "ORGANIZATION_NAME": "MongoDB",
     "DB_USERNAME": "atlasuser",
     "DB_PASSWORD": "mypassword123",
@@ -26,7 +26,7 @@ CONFIG_DEFAULTS = JSONObject({
 })
 
 
-CONFIG_ENVVARS = JSONObject({
+CONFIG_ENVVARS = JSONObject.from_dict({
     "PROJECT_NAME": "EVERGREEN_PROJECT_ID",         # ${project} in EVG
     "CLUSTER_NAME_SALT": "EVERGREEN_BUILD_ID",      # ${build_id} in EVG
     "POLLING_TIMEOUT": "ATLAS_POLLING_TIMEOUT",
@@ -39,7 +39,7 @@ CONFIG_ENVVARS = JSONObject({
 })
 
 
-CLI_OPTION_NAMES = JSONObject({
+CLI_OPTION_NAMES = JSONObject.from_dict({
     "PROJECT_NAME": "--group-name",
     "CLUSTER_NAME_SALT": "--cluster-name-salt",
     "POLLING_TIMEOUT": "--polling-timeout",

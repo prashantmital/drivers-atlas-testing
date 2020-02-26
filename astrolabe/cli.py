@@ -407,9 +407,9 @@ def run_single_test(ctx, spec_test_file, workload_executor,
 
     # Step-1: create the Test-Runner.
     runner = SingleTestRunner(client=ctx.obj,
-                             test_locator_token=spec_test_file,
-                             configuration=config,
-                             xunit_output=xunit_output)
+                              test_locator_token=spec_test_file,
+                              configuration=config,
+                              xunit_output=xunit_output)
     click.echo("---------------- Test Plan ---------------- ")
     click.echo(runner.get_printable_test_plan())
 
