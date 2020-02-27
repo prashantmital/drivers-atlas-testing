@@ -1,0 +1,1938 @@
+########################################
+# Evergreen Template for MongoDB Drivers
+########################################
+
+# When a task that used to pass starts to fail
+# Go through all versions that may have been skipped to detect
+# when the task started failing
+stepback: true
+
+# Mark a failure as a system/bootstrap failure (purple box) rather then a task
+# failure by default.
+# Actual testing tasks are marked with `type: test`
+command_type: system
+
+# Protect ourself against rogue test case, or curl gone wild, that runs forever
+# Good rule of thumb: the averageish length a task takes, times 5
+# That roughly accounts for variable system performance for various buildvariants
+exec_timeout_secs: 1800 # 30 minutes is the longest we'll ever run
+
+# What to do when evergreen hits the timeout (`post:` tasks are run automatically)
+timeout:
+  - command: shell.exec
+    params:
+      script: |
+        ls -la
+
+functions:
+  "fetch source":
+    # Executes git clone and applies the submitted patch, if any
+    - command: git.get_project
+      params:
+        directory: "src"
+    # Applies the subitted patch, if any
+    # Deprecated. Should be removed. But still needed for certain agents (ZAP)
+    - command: git.apply_patch
+    # Make an evergreen exapanstion file with dynamic values
+    - command: shell.exec
+      params:
+        working_dir: "src"
+        script: |
+           # Get the current unique version of this checkout
+           if [ "${is_patch}" = "true" ]; then
+              CURRENT_VERSION=$(git describe)-patch-${version_id}
+           else
+              CURRENT_VERSION=latest
+           fi
+
+           export DRIVERS_TOOLS="$(dirname $(pwd))/drivers-tools"
+           export PROJECT_DIRECTORY="$(pwd)"
+
+           # Python has cygwin path problems on Windows. Detect prospective mongo-orchestration home directory
+           if [ "Windows_NT" = "$OS" ]; then # Magic variable in cygwin
+              export DRIVERS_TOOLS=$(cygpath -m $DRIVERS_TOOLS)
+              export PROJECT_DIRECTORY=$(cygpath -m $PROJECT_DIRECTORY)
+           fi
+
+           export MONGO_ORCHESTRATION_HOME="$DRIVERS_TOOLS/.evergreen/orchestration"
+           export MONGODB_BINARIES="$DRIVERS_TOOLS/mongodb/bin"
+           export UPLOAD_BUCKET="${project}"
+
+           cat <<EOT > expansion.yml
+           CURRENT_VERSION: "$CURRENT_VERSION"
+           DRIVERS_TOOLS: "$DRIVERS_TOOLS"
+           MONGO_ORCHESTRATION_HOME: "$MONGO_ORCHESTRATION_HOME"
+           MONGODB_BINARIES: "$MONGODB_BINARIES"
+           UPLOAD_BUCKET: "$UPLOAD_BUCKET"
+           PROJECT_DIRECTORY: "$PROJECT_DIRECTORY"
+           PREPARE_SHELL: |
+              set -o errexit
+              export DRIVERS_TOOLS="$DRIVERS_TOOLS"
+              export MONGO_ORCHESTRATION_HOME="$MONGO_ORCHESTRATION_HOME"
+              export MONGODB_BINARIES="$MONGODB_BINARIES"
+              export UPLOAD_BUCKET="$UPLOAD_BUCKET"
+              export PROJECT_DIRECTORY="$PROJECT_DIRECTORY"
+
+              export TMPDIR="$MONGO_ORCHESTRATION_HOME/db"
+              export PATH="$MONGODB_BINARIES:$PATH"
+              export PROJECT="${project}"
+           EOT
+           # See what we've done
+           cat expansion.yml
+
+    # Load the expansion file to make an evergreen variable with the current unique version
+    - command: expansions.update
+      params:
+        file: src/expansion.yml
+
+  "prepare resources":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          rm -rf $DRIVERS_TOOLS
+          if [ "${project}" = "drivers-tools" ]; then
+            # If this was a patch build, doing a fresh clone would not actually test the patch
+            cp -R ${PROJECT_DIRECTORY}/ $DRIVERS_TOOLS
+          else
+            git clone git://github.com/mongodb-labs/drivers-evergreen-tools.git $DRIVERS_TOOLS
+          fi
+          echo "{ \"releases\": { \"default\": \"$MONGODB_BINARIES\" }}" > $MONGO_ORCHESTRATION_HOME/orchestration.config
+
+  "upload coverage" :
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file:  src/.coverage
+        optional: true
+        # Upload the coverage report for all tasks in a single build to the same directory.
+        remote_file: ${UPLOAD_BUCKET}/coverage/${revision}/${version_id}/coverage/coverage.${build_variant}.${task_name}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/html
+        display_name: "Raw Coverage Report"
+
+  "download and merge coverage" :
+    - command: shell.exec
+      params:
+        silent: true
+        working_dir: "src"
+        script: |
+          export AWS_ACCESS_KEY_ID=${aws_key}
+          export AWS_SECRET_ACCESS_KEY=${aws_secret}
+
+          # Download all the task coverage files.
+          aws s3 cp --recursive s3://mciuploads/${UPLOAD_BUCKET}/coverage/${revision}/${version_id}/coverage/ coverage/
+    - command: shell.exec
+      params:
+        working_dir: "src"
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          # Coverage combine merges (and removes) all the coverage files and
+          # generates a new .coverage file in the current directory.
+          ls -la coverage/
+          /opt/python/3.6/bin/python3 -m coverage combine coverage/coverage.*
+          /opt/python/3.6/bin/python3 -m coverage html -d htmlcov
+    # Upload the resulting html coverage report.
+    - command: shell.exec
+      params:
+        silent: true
+        working_dir: "src"
+        script: |
+           export AWS_ACCESS_KEY_ID=${aws_key}
+           export AWS_SECRET_ACCESS_KEY=${aws_secret}
+           aws s3 cp htmlcov/ s3://mciuploads/${UPLOAD_BUCKET}/coverage/${revision}/${version_id}/htmlcov/ --recursive --acl public-read --region us-east-1
+    # Attach the index.html with s3.put so it shows up in the Evergreen UI.
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file:  src/htmlcov/index.html
+        remote_file: ${UPLOAD_BUCKET}/coverage/${revision}/${version_id}/htmlcov/index.html
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/html
+        display_name: "Coverage Report HTML"
+
+
+  "upload mo artifacts":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          find $MONGO_ORCHESTRATION_HOME -name \*.log | xargs tar czf mongodb-logs.tar.gz
+    - command: archive.targz_pack
+      params:
+        target: "mongo-coredumps.tgz"
+        source_dir: "./"
+        include:
+          - "./**.core"
+          - "./**.mdmp" # Windows: minidumps
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: mongo-coredumps.tgz
+        remote_file: ${UPLOAD_BUCKET}/${build_variant}/${revision}/${version_id}/${build_id}/coredumps/${task_id}-${execution}-mongodb-coredumps.tar.gz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/gzip}
+        display_name: Core Dumps - Execution
+        optional: true
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: mongodb-logs.tar.gz
+        remote_file: ${UPLOAD_BUCKET}/${build_variant}/${revision}/${version_id}/${build_id}/logs/${task_id}-${execution}-mongodb-logs.tar.gz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: "mongodb-logs.tar.gz"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: drivers-tools/.evergreen/orchestration/server.log
+        remote_file: ${UPLOAD_BUCKET}/${build_variant}/${revision}/${version_id}/${build_id}/logs/${task_id}-${execution}-orchestration.log
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|text/plain}
+        display_name: "orchestration.log"
+
+  "upload working dir":
+    - command: archive.targz_pack
+      params:
+        target: "working-dir.tar.gz"
+        source_dir: ${PROJECT_DIRECTORY}/
+        include:
+          - "./**"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: working-dir.tar.gz
+        remote_file: ${UPLOAD_BUCKET}/${build_variant}/${revision}/${version_id}/${build_id}/artifacts/${task_id}-${execution}-working-dir.tar.gz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: "working-dir.tar.gz"
+    - command: archive.targz_pack
+      params:
+        target: "drivers-dir.tar.gz"
+        source_dir: ${DRIVERS_TOOLS}
+        include:
+          - "./**"
+        exclude_files:
+          # Windows cannot read the mongod *.lock files because they are locked.
+          - "*.lock"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: drivers-dir.tar.gz
+        remote_file: ${UPLOAD_BUCKET}/${build_variant}/${revision}/${version_id}/${build_id}/artifacts/${task_id}-${execution}-drivers-dir.tar.gz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: "drivers-dir.tar.gz"
+
+  "upload test results":
+    - command: attach.results
+      params:
+        file_location: "${DRIVERS_TOOLS}/results.json"
+    - command: attach.xunit_results
+      params:
+        file: "src/xunit-results/TEST-*.xml"
+
+  "bootstrap mongo-orchestration":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+
+          # Enable core dumps if enabled on the machine
+          # Copied from https://github.com/mongodb/mongo/blob/master/etc/evergreen.yml
+          if [ -f /proc/self/coredump_filter ]; then
+            # Set the shell process (and its children processes) to dump ELF headers (bit 4),
+            # anonymous shared mappings (bit 1), and anonymous private mappings (bit 0).
+            echo 0x13 > /proc/self/coredump_filter
+
+            if [ -f /sbin/sysctl ]; then
+              # Check that the core pattern is set explicitly on our distro image instead
+              # of being the OS's default value. This ensures that coredump names are consistent
+              # across distros and can be picked up by Evergreen.
+              core_pattern=$(/sbin/sysctl -n "kernel.core_pattern")
+              if [ "$core_pattern" = "dump_%e.%p.core" ]; then
+                echo "Enabling coredumps"
+                ulimit -c unlimited
+              fi
+            fi
+          fi
+
+          if [ $(uname -s) == "Darwin" ]; then
+              core_pattern_mac=$(/usr/sbin/sysctl -n "kern.corefile")
+              if [ "$core_pattern_mac" = "dump_%N.%P.core" ]; then
+                echo "Enabling coredumps"
+                ulimit -c unlimited
+              fi
+          fi
+
+          ${PREPARE_SHELL}
+          MONGODB_VERSION=${VERSION} \
+            TOPOLOGY=${TOPOLOGY} \
+            AUTH=${AUTH} \
+            SSL=${SSL} \
+            STORAGE_ENGINE=${STORAGE_ENGINE} \
+            DISABLE_TEST_COMMANDS=${DISABLE_TEST_COMMANDS} \
+            ORCHESTRATION_FILE=${ORCHESTRATION_FILE} \
+            sh ${DRIVERS_TOOLS}/.evergreen/run-orchestration.sh
+    # run-orchestration generates expansion file with the MONGODB_URI for the cluster
+    - command: expansions.update
+      params:
+        file: mo-expansion.yml
+    - command: expansions.update
+      params:
+        updates:
+          - key: MONGODB_STARTED
+            value: "1"
+
+  "stop mongo-orchestration":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          sh ${DRIVERS_TOOLS}/.evergreen/stop-orchestration.sh
+
+  "run mod_wsgi tests":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          PYTHON_BINARY=${PYTHON_BINARY} MOD_WSGI_VERSION=${MOD_WSGI_VERSION} PROJECT_DIRECTORY=${PROJECT_DIRECTORY} sh ${PROJECT_DIRECTORY}/.evergreen/run-mod-wsgi-tests.sh
+
+  "run mockupdb tests":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          PYTHON_BINARY=${PYTHON_BINARY} PROJECT_DIRECTORY=${PROJECT_DIRECTORY} sh ${PROJECT_DIRECTORY}/.evergreen/run-mockupdb-tests.sh
+
+  "run cdecimal tests":
+     - command: shell.exec
+       type: test
+       params:
+         working_dir: "src"
+         script: |
+           set -o xtrace
+           ${PREPARE_SHELL}
+           PYTHON_BINARY=${PYTHON_BINARY} sh ${PROJECT_DIRECTORY}/.evergreen/run-cdecimal-tests.sh
+
+  "run pyopenssl tests":
+     - command: shell.exec
+       type: test
+       params:
+         working_dir: "src"
+         script: |
+           set -o xtrace
+           ${PREPARE_SHELL}
+           PYTHON_BINARY=${PYTHON_BINARY} sh ${PROJECT_DIRECTORY}/.evergreen/run-pyopenssl-tests.sh
+
+  "run doctests":
+     - command: shell.exec
+       type: test
+       params:
+         working_dir: "src"
+         script: |
+           set -o xtrace
+           ${PREPARE_SHELL}
+           PYTHON_BINARY=${PYTHON_BINARY} sh ${PROJECT_DIRECTORY}/.evergreen/run-doctests.sh
+
+  "run tests":
+    - command: shell.exec
+      type: test
+      params:
+        silent: true
+        working_dir: "src"
+        script: |
+          if [ -n "${test_encryption}" ]; then
+            cat <<EOT > fle_aws_creds.sh
+            export FLE_AWS_KEY="${fle_aws_key}"
+            export FLE_AWS_SECRET="${fle_aws_secret}"
+          EOT
+          fi
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          if [ -n "${set_xtrace_on}" ]; then
+            set -o xtrace
+            export SET_XTRACE_ON="${set_xtrace_on}"
+          fi
+          ${PREPARE_SHELL}
+          if [ -n "${MONGODB_STARTED}" ]; then
+            export PYMONGO_MUST_CONNECT=1
+          fi
+          if [ -n "${DISABLE_TEST_COMMANDS}" ]; then
+            export PYMONGO_DISABLE_TEST_COMMANDS=1
+          fi
+          if [ -n "${test_encryption}" ]; then
+            # Disable xtrace (just in case it was accidentally set).
+            set +x
+            . ./fle_aws_creds.sh
+            rm -f ./fle_aws_creds.sh
+            export LIBMONGOCRYPT_URL="${libmongocrypt_url}"
+            export TEST_ENCRYPTION=1
+          fi
+          if [ -n "${SETDEFAULTENCODING}" ]; then
+            export SETDEFAULTENCODING="${SETDEFAULTENCODING}"
+          fi
+
+          PYTHON_BINARY=${PYTHON_BINARY} \
+            GREEN_FRAMEWORK=${GREEN_FRAMEWORK} \
+            C_EXTENSIONS=${C_EXTENSIONS} \
+            COVERAGE=${COVERAGE} \
+            COMPRESSORS=${COMPRESSORS} \
+            AUTH=${AUTH} \
+            SSL=${SSL} \
+            sh ${PROJECT_DIRECTORY}/.evergreen/run-tests.sh
+
+  "run enterprise auth tests":
+    - command: shell.exec
+      type: test
+      params:
+        silent: true
+        working_dir: "src"
+        script: |
+          # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
+          PYTHON_BINARY=${PYTHON_BINARY} SASL_HOST=${sasl_host} SASL_PORT=${sasl_port} SASL_USER=${sasl_user} SASL_PASS=${sasl_pass} SASL_DB=${sasl_db} PRINCIPAL=${principal} GSSAPI_DB=${gssapi_db} KEYTAB_BASE64=${keytab_base64} PROJECT_DIRECTORY=${PROJECT_DIRECTORY} sh ${PROJECT_DIRECTORY}/.evergreen/run-enterprise-auth-tests.sh
+
+  "run atlas tests":
+    - command: shell.exec
+      type: test
+      params:
+        silent: true
+        working_dir: "src"
+        script: |
+          # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
+          PYTHON_BINARY=${PYTHON_BINARY} ATLAS_REPL='${atlas_repl}' ATLAS_SHRD='${atlas_shrd}' ATLAS_FREE='${atlas_free}' ATLAS_TLS11='${atlas_tls11}' ATLAS_TLS12='${atlas_tls12}'  sh ${PROJECT_DIRECTORY}/.evergreen/run-atlas-tests.sh
+
+  "cleanup":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          rm -rf $DRIVERS_TOOLS || true
+
+  "fix absolute paths":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          for filename in $(find ${DRIVERS_TOOLS} -name \*.json); do
+            perl -p -i -e "s|ABSOLUTE_PATH_REPLACEMENT_TOKEN|${DRIVERS_TOOLS}|g" $filename
+          done
+
+  "windows fix":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          for i in $(find ${DRIVERS_TOOLS}/.evergreen ${PROJECT_DIRECTORY}/.evergreen -name \*.sh); do
+            cat $i | tr -d '\r' > $i.new
+            mv $i.new $i
+          done
+          # Copy client certificate because symlinks do not work on Windows.
+          cp ${DRIVERS_TOOLS}/.evergreen/x509gen/client.pem ${MONGO_ORCHESTRATION_HOME}/lib/client.pem
+
+  "make files executable":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          for i in $(find ${DRIVERS_TOOLS}/.evergreen ${PROJECT_DIRECTORY}/.evergreen -name \*.sh); do
+            chmod +x $i
+          done
+
+  "init test-results":
+    - command: shell.exec
+      params:
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          echo '{"results": [{ "status": "FAIL", "test_file": "Build", "log_raw": "No test-results.json found was created"  } ]}' > ${PROJECT_DIRECTORY}/test-results.json
+
+  "install dependencies":
+    - command: shell.exec
+      params:
+        working_dir: "src"
+        script: |
+          set -o xtrace
+          ${PREPARE_SHELL}
+          file="${PROJECT_DIRECTORY}/.evergreen/install-dependencies.sh"
+          # Don't use ${file} syntax here because evergreen treats it as an empty expansion.
+          [ -f "$file" ] && sh $file || echo "$file not available, skipping"
+
+  "run-ocsp-test":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          ${PREPARE_SHELL}
+          CA_FILE="$DRIVERS_TOOLS/.evergreen/ocsp/rsa/ca.pem" \
+          OCSP_TLS_SHOULD_SUCCEED="${OCSP_TLS_SHOULD_SUCCEED}" \
+          sh ${PROJECT_DIRECTORY}/.evergreen/run-ocsp-tests.sh
+
+  "run-valid-ocsp-server":
+    - command: shell.exec
+      params:
+        script: |
+          cd ${DRIVERS_TOOLS}/.evergreen/ocsp
+          /opt/mongodbtoolchain/v3/bin/python3 -m venv ./venv
+          ./venv/bin/pip3 install asn1crypto oscrypto bottle
+    - command: shell.exec
+      params:
+        background: true
+        script: |
+          cd ${DRIVERS_TOOLS}/.evergreen/ocsp
+          nohup ./venv/bin/python3 ocsp_mock.py \
+          --ca_file rsa/ca.pem \
+          --ocsp_responder_cert rsa/ca.crt \
+          --ocsp_responder_key rsa/ca.key \
+          -p 8100 -v
+
+  "run-revoked-ocsp-server":
+    - command: shell.exec
+      params:
+        script: |
+          cd ${DRIVERS_TOOLS}/.evergreen/ocsp
+          /opt/mongodbtoolchain/v3/bin/python3 -m venv ./venv
+          ./venv/bin/pip3 install asn1crypto oscrypto bottle
+    - command: shell.exec
+      params:
+        background: true
+        script: |
+          cd ${DRIVERS_TOOLS}/.evergreen/ocsp
+          nohup ./venv/bin/python3 ocsp_mock.py \
+          --ca_file rsa/ca.pem \
+          --ocsp_responder_cert rsa/ca.crt \
+          --ocsp_responder_key rsa/ca.key \
+          -p 8100 \
+          -v \
+          --fault revoked
+
+pre:
+  - func: "fetch source"
+  - func: "prepare resources"
+  - func: "windows fix"
+  - func: "fix absolute paths"
+  - func: "init test-results"
+  - func: "make files executable"
+  - func: "install dependencies"
+
+post:
+  # Disabled, causing timeouts
+  # - func: "upload working dir"
+  - func: "upload coverage"
+  - func: "upload mo artifacts"
+  - func: "upload test results"
+  - func: "stop mongo-orchestration"
+  - func: "cleanup"
+
+tasks:
+
+
+    # Wildcard task. Do you need to find out what tools are available and where?
+    # Throw it here, and execute this task on all buildvariants
+    - name: getdata
+      commands:
+        - command: shell.exec
+          type: test
+          params:
+            script: |
+               set -o xtrace
+               . ${DRIVERS_TOOLS}/.evergreen/download-mongodb.sh || true
+               get_distro || true
+               echo $DISTRO
+               echo $MARCH
+               echo $OS
+               uname -a || true
+               ls /etc/*release* || true
+               cc --version || true
+               gcc --version || true
+               clang --version || true
+               gcov --version || true
+               lcov --version || true
+               llvm-cov --version || true
+               echo $PATH
+               ls -la /usr/local/Cellar/llvm/*/bin/ || true
+               ls -la /usr/local/Cellar/ || true
+               scan-build --version || true
+               genhtml --version || true
+               valgrind --version || true
+
+# Standard test tasks {{{
+
+    - name: "mockupdb"
+      tags: ["mockupdb"]
+      commands:
+        - func: "run mockupdb tests"
+
+    - name: "doctests"
+      tags: ["doctests"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run doctests"
+
+    - name: "test-2.6-standalone"
+      tags: ["2.6", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "2.6"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-2.6-replica_set"
+      tags: ["2.6", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "2.6"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-2.6-sharded_cluster"
+      tags: ["2.6", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "2.6"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-3.0-standalone"
+      tags: ["3.0", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.0"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-3.0-replica_set"
+      tags: ["3.0", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.0"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-3.0-sharded_cluster"
+      tags: ["3.0", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.0"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-3.2-standalone"
+      tags: ["3.2", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.2"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-3.2-replica_set"
+      tags: ["3.2", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.2"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-3.2-sharded_cluster"
+      tags: ["3.2", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.2"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-3.4-standalone"
+      tags: ["3.4", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.4"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-3.4-replica_set"
+      tags: ["3.4", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.4"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-3.4-sharded_cluster"
+      tags: ["3.4", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.4"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-3.6-standalone"
+      tags: ["3.6", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.6"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-3.6-replica_set"
+      tags: ["3.6", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.6"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-3.6-sharded_cluster"
+      tags: ["3.6", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "3.6"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-4.0-standalone"
+      tags: ["4.0", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "4.0"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-4.0-replica_set"
+      tags: ["4.0", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "4.0"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-4.0-sharded_cluster"
+      tags: ["4.0", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "4.0"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-4.2-standalone"
+      tags: ["4.2", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "4.2"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-4.2-replica_set"
+      tags: ["4.2", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "4.2"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-4.2-sharded_cluster"
+      tags: ["4.2", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "4.2"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-latest-standalone"
+      tags: ["latest", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-latest-replica_set"
+      tags: ["latest", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-latest-sharded_cluster"
+      tags: ["latest", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-enterprise-auth"
+      tags: ["enterprise-auth"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run enterprise auth tests"
+
+    - name: "mod-wsgi-standalone"
+      tags: ["mod_wsgi"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run mod_wsgi tests"
+
+    - name: "mod-wsgi-replica-set"
+      tags: ["mod_wsgi"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "replica_set"
+        - func: "run mod_wsgi tests"
+
+    - name: "cdecimal"
+      tags: ["cdecimal"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run cdecimal tests"
+
+    # Use latest for this, since we're
+    # adding this to support OCSP stapling
+    - name: "pyopenssl"
+      tags: ["pyopenssl"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run pyopenssl tests"
+
+    - name: "no-server"
+      tags: ["no-server"]
+      commands:
+        - func: "run tests"
+          vars:
+            PYTHON_BINARY: /opt/python/2.7/bin/python
+
+    - name: "atlas-connect"
+      tags: ["atlas-connect"]
+      commands:
+        - func: "run atlas tests"
+
+    - name: "test-ocsp-valid-cert-server-staples"
+      tags: ["ocsp"]
+      commands:
+        - func: "run-valid-ocsp-server"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            ORCHESTRATION_FILE: "rsa-basic-tls-ocsp-mustStaple.json"
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run-ocsp-test"
+          vars:
+            OCSP_TLS_SHOULD_SUCCEED: "1"
+
+    - name: "test-ocsp-invalid-cert-server-staples"
+      tags: ["ocsp"]
+      commands:
+        - func: "run-revoked-ocsp-server"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            ORCHESTRATION_FILE: "rsa-basic-tls-ocsp-mustStaple.json"
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run-ocsp-test"
+          vars:
+            OCSP_TLS_SHOULD_SUCCEED: "0"
+
+    - name: "test-ocsp-valid-cert-server-does-not-staple"
+      tags: ["ocsp"]
+      commands:
+        - func: "run-valid-ocsp-server"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            ORCHESTRATION_FILE: "rsa-basic-tls-ocsp-disableStapling.json"
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run-ocsp-test"
+          vars:
+            OCSP_TLS_SHOULD_SUCCEED: "1"
+
+    - name: "test-ocsp-invalid-cert-server-does-not-staple"
+      tags: ["ocsp"]
+      commands:
+        - func: "run-revoked-ocsp-server"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            ORCHESTRATION_FILE: "rsa-basic-tls-ocsp-disableStapling.json"
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run-ocsp-test"
+          vars:
+            OCSP_TLS_SHOULD_SUCCEED: "0"
+
+    - name: "test-ocsp-soft-fail"
+      tags: ["ocsp"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            ORCHESTRATION_FILE: "rsa-basic-tls-ocsp-disableStapling.json"
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run-ocsp-test"
+          vars:
+            OCSP_TLS_SHOULD_SUCCEED: "1"
+
+    - name: "test-ocsp-malicious-invalid-cert-mustStaple-server-does-not-staple"
+      tags: ["ocsp"]
+      commands:
+        - func: "run-revoked-ocsp-server"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            ORCHESTRATION_FILE: "rsa-basic-tls-ocsp-mustStaple-disableStapling.json"
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run-ocsp-test"
+          vars:
+            OCSP_TLS_SHOULD_SUCCEED: "0"
+
+    - name: "test-ocsp-malicious-no-responder-mustStaple-server-does-not-staple"
+      tags: ["ocsp"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            ORCHESTRATION_FILE: "rsa-basic-tls-ocsp-mustStaple-disableStapling.json"
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run-ocsp-test"
+          vars:
+            OCSP_TLS_SHOULD_SUCCEED: "0"
+
+# }}}
+    - name: "coverage-report"
+      tags: ["coverage"]
+      depends_on:
+        # BUILD-3165: We can't use "*" (all tasks) and specify "variant".
+        # Instead list out all coverage tasks using tags.
+        - name: ".standalone"
+          variant: ".coverage_tag"
+          # Run the coverage task even if some tasks fail.
+          status: "*"
+          # Run the coverage task even if some tasks are not scheduled in a patch build.
+          patch_optional: true
+        - name: ".replica_set"
+          variant: ".coverage_tag"
+          status: "*"
+          patch_optional: true
+        - name: ".sharded_cluster"
+          variant: ".coverage_tag"
+          status: "*"
+          patch_optional: true
+      commands:
+        - func: "download and merge coverage"
+
+
+axes:
+  # Choice of distro
+  - id: platform
+    display_name: OS
+    values:
+      - id: awslinux
+        display_name: "Amazon Linux 2018 (Enterprise)"
+        run_on: amazon1-2018-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/linux-64-amazon-ami/master/latest/libmongocrypt.tar.gz
+      - id: archlinux-test
+        display_name: "Archlinux"
+        run_on: archlinux-test
+        batchtime: 10080  # 7 days
+      - id: debian71
+        display_name: "Debian 7.1"
+        run_on: debian71-test
+        batchtime: 10080  # 7 days
+      - id: debian81
+        display_name: "Debian 8.1"
+        run_on: debian81-test
+        batchtime: 10080  # 7 days
+      - id: debian92
+        display_name: "Debian 9.2"
+        run_on: debian92-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/debian92/master/latest/libmongocrypt.tar.gz
+      - id: macos-1014
+        display_name: "macOS 10.14"
+        run_on: macos-1014
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/macos/master/latest/libmongocrypt.tar.gz
+      - id: rhel62
+        display_name: "RHEL 6.2 (x86_64)"
+        run_on: rhel62-small
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/rhel-62-64-bit/master/latest/libmongocrypt.tar.gz
+      - id: rhel70
+        display_name: "RHEL 7.0"
+        run_on: rhel70-small
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/rhel-70-64-bit/master/latest/libmongocrypt.tar.gz
+      - id: rhel71-power8-test
+        display_name: "RHEL 7.1 (POWER8)"
+        run_on: rhel71-power8-test
+        batchtime: 10080  # 7 days
+      - id: rhel72-zseries-test
+        display_name: "RHEL 7.2 (zSeries)"
+        run_on: rhel72-zseries-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/rhel72-zseries-test/master/latest/libmongocrypt.tar.gz
+      - id: suse12-x86-64-test
+        display_name: "SUSE 12 (x86_64)"
+        run_on: suse12-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/suse12-64/master/latest/libmongocrypt.tar.gz
+      - id: ubuntu-12.04
+        display_name: "Ubuntu 12.04"
+        run_on: ubuntu1204-test
+        batchtime: 10080  # 7 days
+      - id: ubuntu-16.04
+        display_name: "Ubuntu 16.04"
+        run_on: ubuntu1604-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/ubuntu1604/master/latest/libmongocrypt.tar.gz
+      - id: ubuntu1604-arm64-small
+        display_name: "Ubuntu 16.04 (ARM64)"
+        run_on: ubuntu1604-arm64-small
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/ubuntu1604-arm64/master/latest/libmongocrypt.tar.gz
+      - id: ubuntu1604-power8-test
+        display_name: "Ubuntu 16.04 (POWER8)"
+        run_on: ubuntu1604-power8-test
+        batchtime: 10080  # 7 days
+      - id: ubuntu1804-arm64-test
+        display_name: "Ubuntu 18.04 (ARM64)"
+        run_on: ubuntu1804-arm64-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/ubuntu1804-arm64/master/latest/libmongocrypt.tar.gz
+      - id: windows-vs2010
+        display_name: "Windows 64 Visual Studio 2010"
+        run_on: windows-64-vs2010-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/windows-test/master/latest/libmongocrypt.tar.gz
+      - id: windows-vs2015
+        display_name: "Windows 64 Visual Studio 2015"
+        run_on: windows-64-vs2015-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/windows-test/master/latest/libmongocrypt.tar.gz
+      - id: windows-vs2017
+        display_name: "Windows 64 Visual Studio 2017"
+        run_on: windows-64-vs2017-test
+        batchtime: 10080  # 7 days
+        variables:
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/windows-test/master/latest/libmongocrypt.tar.gz
+
+  # Test with authentication?
+  - id: auth
+    display_name: Authentication
+    values:
+      - id: auth
+        display_name: Auth
+        variables:
+           AUTH: "auth"
+      - id: noauth
+        display_name: NoAuth
+        variables:
+           AUTH: "noauth"
+
+  # Test with SSL?
+  - id: ssl
+    display_name: SSL
+    values:
+      - id: ssl
+        display_name: SSL
+        variables:
+           SSL: "ssl"
+      - id: nossl
+        display_name: NoSSL
+        variables:
+           SSL: "nossl"
+
+  # Test with Auth + SSL (combined for convenience)?
+  - id: auth-ssl
+    display_name: Auth SSL
+    values:
+      - id: auth-ssl
+        display_name: Auth SSL
+        variables:
+           AUTH: "auth"
+           SSL: "ssl"
+      - id: noauth-nossl
+        display_name: NoAuth NoSSL
+        variables:
+           AUTH: "noauth"
+           SSL: "nossl"
+
+  # Choice of wire protocol compression support
+  - id: compression
+    display_name: Compression
+    values:
+      - id: snappy
+        display_name: snappy compression
+        variables:
+            COMPRESSORS: "snappy"
+      - id: zlib
+        display_name: zlib compression
+        variables:
+            COMPRESSORS: "zlib"
+      - id: zstd
+        display_name: zstd compression
+        variables:
+            COMPRESSORS: "zstd"
+
+  # Choice of Python runtime version
+  - id: python-version
+    display_name: "Python"
+    values:
+      # Note: always display platform with python-version to avoid ambiguous display names.
+      # Linux
+      - id: "2.7"
+        display_name: "Python 2.7"
+        variables:
+           PYTHON_BINARY: "/opt/python/2.7/bin/python"
+      - id: "3.4"
+        display_name: "Python 3.4"
+        variables:
+           PYTHON_BINARY: "/opt/python/3.4/bin/python3"
+      - id: "3.5"
+        display_name: "Python 3.5"
+        batchtime: 10080  # 7 days
+        variables:
+           PYTHON_BINARY: "/opt/python/3.5/bin/python3"
+      - id: "3.6"
+        display_name: "Python 3.6"
+        variables:
+           PYTHON_BINARY: "/opt/python/3.6/bin/python3"
+      - id: "3.7"
+        display_name: "Python 3.7"
+        variables:
+          PYTHON_BINARY: "/opt/python/3.7/bin/python3"
+      - id: "3.8"
+        display_name: "Python 3.8"
+        variables:
+          PYTHON_BINARY: "/opt/python/3.8/bin/python3"
+      - id: "pypy"
+        display_name: "PyPy"
+        variables:
+           PYTHON_BINARY: "/opt/python/pypy/bin/pypy"
+      - id: "pypy3.5"
+        display_name: "PyPy 3.5"
+        variables:
+           PYTHON_BINARY: "/opt/python/pypy3.5/bin/pypy3"
+      - id: "pypy3.6"
+        display_name: "PyPy 3.6"
+        variables:
+           PYTHON_BINARY: "/opt/python/pypy3.6/bin/pypy3"
+      - id: "jython2.7"
+        display_name: "Jython 2.7"
+        batchtime: 10080  # 7 days
+        variables:
+           PYTHON_BINARY: "/opt/python/jython2.7/bin/jython"
+      # Windows
+      - id: "win-vs2010-3.4"
+        display_name: "Python 3.4"
+        variables:
+          PYTHON_BINARY: "/cygdrive/c/python/Python34/python.exe"
+      - id: "win-vs2015-2.7"
+        display_name: "Python 2.7"
+        variables:
+          PYTHON_BINARY: "/cygdrive/c/python/Python27/python.exe"
+      - id: "win-vs2015-3.5"
+        display_name: "Python 3.5"
+        variables:
+          PYTHON_BINARY: "/cygdrive/c/python/Python35/python.exe"
+      - id: "win-vs2015-3.6"
+        display_name: "Python 3.6"
+        variables:
+          PYTHON_BINARY: "/cygdrive/c/python/Python36/python.exe"
+      - id: "win-vs2015-3.7"
+        display_name: "Python 3.7"
+        variables:
+          PYTHON_BINARY: "/cygdrive/c/python/Python37/python.exe"
+
+  # Choice of mod_wsgi version
+  - id: mod-wsgi-version
+    display_name: "mod_wsgi version"
+    values:
+      - id: "3"
+        display_name: "mod_wsgi 3.5"
+        variables:
+          MOD_WSGI_VERSION: "3"
+      - id: "4"
+        display_name: "mod_wsgi 4.x"
+        variables:
+          MOD_WSGI_VERSION: "4"
+
+  # Choice of Python async framework
+  - id: green-framework
+    display_name: "Green Framework"
+    values:
+      - id: "eventlet"
+        display_name: "Eventlet"
+        variables:
+          GREEN_FRAMEWORK: "eventlet"
+      - id: "gevent"
+        display_name: "Gevent"
+        variables:
+          GREEN_FRAMEWORK: "gevent"
+
+  # Install and use the driver's C-extensions?
+  - id: c-extensions
+    display_name: "C Extensions"
+    values:
+      - id: "without-c-extensions"
+        display_name: "Without C Extensions"
+        variables:
+          C_EXTENSIONS: "--no_ext"
+      - id: "with-c-extensions"
+        display_name: "With C Extensions"
+        variables:
+          C_EXTENSIONS: ""
+
+  # Choice of MongoDB storage engine
+  - id: storage-engine
+    display_name: Storage
+    values:
+      - id: mmapv1
+        display_name: MMAPv1
+        variables:
+           STORAGE_ENGINE: "mmapv1"
+      - id: wiredtiger
+        display_name: WiredTiger
+        variables:
+           STORAGE_ENGINE: "wiredtiger"
+      - id: inmemory
+        display_name: InMemory
+        variables:
+           STORAGE_ENGINE: "inmemory"
+
+  # Run with test commands disabled on server?
+  - id: disableTestCommands
+    display_name: Disable test commands
+    values:
+      - id: disabled
+        display_name: disabled
+        variables:
+           DISABLE_TEST_COMMANDS: "1"
+
+  # Generate coverage report?
+  - id: coverage
+    display_name: "Coverage"
+    values:
+      - id: "coverage"
+        display_name: "Coverage"
+        tags: ["coverage_tag"]
+        variables:
+           COVERAGE: "coverage"
+
+  # Run encryption tests?
+  - id: encryption
+    display_name: "Encryption"
+    values:
+      - id: "encryption"
+        display_name: "Encryption"
+        tags: ["encryption_tag"]
+        variables:
+          test_encryption: true
+
+  # Run setdefaultencoding before running the test suite?
+  - id: setdefaultencoding
+    display_name: "setdefaultencoding"
+    values:
+      - id: "setdefaultencoding"
+        display_name: "setdefaultencoding"
+        tags: ["setdefaultencoding_tag"]
+        variables:
+          SETDEFAULTENCODING: "cp1251"
+
+buildvariants:
+- matrix_name: "tests-all"
+  matrix_spec:
+    platform:
+      # OSes that support versions of MongoDB>=2.6 with SSL.
+      - awslinux
+      - rhel70
+    auth-ssl: "*"
+  display_name: "${platform} ${auth-ssl}"
+  tasks: &all-server-versions
+    - ".latest"
+    - ".4.2"
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+    - ".3.2"
+    - ".3.0"
+    - ".2.6"
+
+- matrix_name: "tests-all-encryption"
+  matrix_spec:
+    platform:
+      # OSes that support versions of MongoDB>=2.6 with SSL.
+      - awslinux
+      - rhel70
+    auth-ssl: "*"
+    encryption: "*"
+  display_name: "Encryption ${platform} ${auth-ssl}"
+  tasks: &encryption-server-versions
+    - ".4.2"
+    - ".4.0"
+    - ".2.6"
+
+- matrix_name: "tests-no-36-plus"
+  matrix_spec:
+    platform:
+      # OSes that support versions of MongoDB>=2.6 and <3.6 with SSL.
+      - ubuntu-12.04
+    auth-ssl: "*"
+    # Ubuntu 12 ships Python 2.7.3. We want to test that version with
+    # and without C extensions
+    c-extensions: "*"
+  display_name: "${platform} ${auth-ssl} ${c-extensions}"
+  tasks:
+    - ".3.4"
+    - ".3.2"
+    - ".3.0"
+    - ".2.6"
+
+- matrix_name: "tests-no-40-plus"
+  matrix_spec:
+    platform:
+      # OSes that support versions of MongoDB>=2.6 and <4.0 with SSL.
+      - debian71
+    auth-ssl: "*"
+    # Debian 7 ships Python 2.7.3. We want to test that version with
+    # and without C extensions
+    c-extensions: "*"
+  display_name: "${platform} ${auth-ssl} ${c-extensions}"
+  tasks:
+    - ".3.6"
+    - ".3.4"
+    - ".3.2"
+    - ".3.0"
+    - ".2.6"
+
+- matrix_name: "tests-archlinux"
+  matrix_spec:
+    platform:
+      # Archlinux supports MongoDB without SSL.
+      # MongoDB 4.2 drops support for archlinux (generic linux builds).
+      - archlinux-test
+    auth: "*"
+    ssl: "nossl"
+  display_name: "${platform} ${auth} ${ssl}"
+  tasks:
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+    - ".3.2"
+    - ".3.0"
+    - ".2.6"
+
+- matrix_name: "tests-os-requires-32"
+  matrix_spec:
+    platform:
+      # OSes that support versions of MongoDB>=3.2 with SSL.
+      - ubuntu-16.04
+      - suse12-x86-64-test
+      - rhel71-power8-test
+    auth-ssl: "*"
+  display_name: "${platform} ${auth-ssl}"
+  tasks:
+    - ".latest"
+    - ".4.2"
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+    - ".3.2"
+
+- matrix_name: "test-macos"
+  matrix_spec:
+    platform:
+      # MacOS introduced SSL support with MongoDB >= 3.2.
+      # Older server versions (2.6, 3.0) are supported without SSL.
+      - macos-1014
+    auth: "*"
+    ssl: "*"
+  exclude_spec:
+    # No point testing with SSL without auth.
+    - platform: macos-1014
+      auth: "noauth"
+      ssl: "ssl"
+  display_name: "${platform} ${auth} ${ssl}"
+  tasks:
+    - ".latest"
+    - ".4.2"
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+    - ".3.2"
+  rules:
+    - if:
+        platform: macos-1014
+        auth: "*"
+        ssl: "nossl"
+      then:
+        add_tasks:
+          - ".3.0"
+          - ".2.6"
+
+- matrix_name: "test-macos-encryption"
+  matrix_spec:
+    platform:
+      - macos-1014
+    auth: "auth"
+    ssl: "nossl"
+    encryption: "*"
+  display_name: "Encryption ${platform} ${auth} ${ssl}"
+  tasks: *encryption-server-versions
+
+- matrix_name: "test-os-requires-34-no-42plus"
+  matrix_spec:
+    platform:
+      # OSes that support versions of MongoDB>=3.4 <4.2 with SSL.
+      - debian81
+      - ubuntu1604-power8-test
+      - ubuntu1604-arm64-small
+    auth-ssl: "*"
+  display_name: "${platform} ${auth-ssl}"
+  tasks:
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+
+- matrix_name: "test-os-requires-34"
+  matrix_spec:
+    platform:
+      # OSes that support versions of MongoDB>=3.4 with SSL.
+      - rhel72-zseries-test
+    auth-ssl: "*"
+  display_name: "${platform} ${auth-ssl}"
+  tasks:
+    - ".latest"
+    - ".4.2"
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+
+- matrix_name: "test-os-requires-42"
+  matrix_spec:
+    platform:
+      # OSes that support versions of MongoDB>=4.2 with SSL.
+      - ubuntu1804-arm64-test
+    auth-ssl: "*"
+  display_name: "${platform} ${auth-ssl}"
+  tasks:
+    - ".latest"
+    - ".4.2"
+  variables:
+    set_xtrace_on: on
+
+- matrix_name: "tests-python-version-rhel62-test-ssl"
+  matrix_spec:
+    platform: rhel62
+    # RHEL 6.2 does not support Python 3.7.x and later.
+    python-version: &rhel62-pythons ["2.7", "3.4", "3.5", "3.6", "pypy", "pypy3.5", "pypy3.6", "jython2.7"]
+    auth: "*"
+    ssl: "*"
+    coverage: "*"
+  exclude_spec:
+    - platform: rhel62
+      python-version: "*"
+      auth: "noauth"
+      ssl: "ssl"
+      coverage: "*"
+    - platform: rhel62
+      python-version: "!jython2.7" # Test Jython with Auth/NoSSL
+      auth: "auth"
+      ssl: "nossl"
+      coverage: "*"
+    - platform: rhel62
+      # PYTHON-498: disable Jython SSL tests
+      python-version: "jython2.7"
+      # EVG-1410: exlcude_spec must specifiy values for all axes
+      auth: "*"
+      ssl: "ssl"
+      coverage: "*"
+  display_name: "${python-version} ${platform} ${auth} ${ssl} ${coverage}"
+  tasks: *all-server-versions
+
+- matrix_name: "tests-pyopenssl"
+  matrix_spec:
+    platform: ubuntu-16.04
+    python-version: ["2.7", "3.4", "3.5", "3.6", "3.7", "pypy", "pypy3.5"]
+    auth: "*"
+    ssl: "ssl"
+  display_name: "PyOpenSSL ${python-version} ${platform} ${auth}"
+  tasks:
+    - "pyopenssl"
+
+- matrix_name: "test-pyopenssl-old-py27"
+  matrix_spec:
+    platform:
+      # Supported OSes with pre-2.7.9 CPython versions.
+      - rhel70 # CPython 2.7.5
+    auth: "*"
+    ssl: "ssl"
+  display_name: "PyOpenSSL Pre-2.7.9 Python ${platform} ${auth}"
+  tasks:
+    - "pyopenssl"
+
+- matrix_name: "tests-python-version-rhel62-test-encryption"
+  matrix_spec:
+    platform: rhel62
+    # RHEL 6.2 does not support Python 3.7.x and later.
+    python-version: ["2.7", "3.4", "3.5", "3.6", "pypy", "pypy3.5", "pypy3.6"]
+    auth-ssl: noauth-nossl
+# TODO: dependency error for 'coverage-report' task:
+# dependency tests-python-version-rhel62-test-encryption_.../test-2.6-standalone is not present in the project config
+#    coverage: "*"
+    encryption: "*"
+  display_name: "Encryption ${python-version} ${platform} ${auth-ssl}"
+  tasks: *encryption-server-versions
+
+- matrix_name: "tests-python-version-rhel62-without-c-extensions"
+  matrix_spec:
+    platform: rhel62
+    python-version: *rhel62-pythons
+    c-extensions: without-c-extensions
+    auth-ssl: noauth-nossl
+    coverage: "*"
+  exclude_spec:
+   # These interpreters are always tested without extensions.
+   - platform: rhel62
+     python-version: ["pypy", "pypy3.5", "pypy3.6", "jython2.7"]
+     c-extensions: "*"
+     auth-ssl: "*"
+     coverage: "*"
+  display_name: "${c-extensions} ${python-version} ${platform} ${auth} ${ssl} ${coverage}"
+  tasks: *all-server-versions
+
+- matrix_name: "tests-python-version-ubuntu1604-without-c-extensions"
+  matrix_spec:
+    platform: ubuntu-16.04
+    python-version: &openssl-102-plus-pythons ["3.7", "3.8"]
+    c-extensions: without-c-extensions
+    auth-ssl: noauth-nossl
+  display_name: "${c-extensions} ${python-version} ${platform} ${auth} ${ssl} ${coverage}"
+  tasks:
+    - ".latest"
+    - ".4.2"
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+    - ".3.2"
+
+- matrix_name: "tests-python-version-ubuntu16-compression"
+  matrix_spec:
+    # Ubuntu 16.04 images have libsnappy-dev installed, and provides OpenSSL 1.0.2 for testing Python 3.7
+    platform: ubuntu-16.04
+    python-version: ["2.7", "3.4", "3.5", "3.6", "3.7", "3.8", "pypy", "pypy3.5", "pypy3.6", "jython2.7"]
+    c-extensions: "*"
+    compression: "*"
+  exclude_spec:
+   # These interpreters are always tested without extensions.
+   - platform: ubuntu-16.04
+     python-version: ["pypy", "pypy3.5", "pypy3.6", "jython2.7"]
+     c-extensions: "with-c-extensions"
+     compression: "*"
+  # Jython doesn't support some compression types.
+   - platform: ubuntu-16.04
+     python-version: ["jython2.7"]
+     c-extensions: "*"
+     compression: ["snappy", "zstd"]
+  # Some tests fail with CPython 3.8 and python-snappy
+   - platform: ubuntu-16.04
+     python-version: ["3.8"]
+     c-extensions: "*"
+     compression: ["snappy"]
+  display_name: "${compression} ${c-extensions} ${python-version} ${platform}"
+  tasks:
+    - "test-latest-standalone"
+    - "test-4.2-standalone"
+  rules:
+    # Server versions 3.6 and 4.0 support snappy and zlib.
+    - if:
+        python-version: "*"
+        c-extensions: "*"
+        compression: ["snappy", "zlib"]
+      then:
+        add_tasks:
+          - "test-4.0-standalone"
+          - "test-3.6-standalone"
+
+- matrix_name: "tests-python-version-green-framework-rhel62"
+  matrix_spec:
+    platform: rhel62
+    python-version: *rhel62-pythons
+    green-framework: "*"
+    auth-ssl: "*"
+  exclude_spec:
+   # Don't test green frameworks on these Python versions.
+   - platform: rhel62
+     python-version: ["pypy", "pypy3.5", "pypy3.6", "jython2.7"]
+     green-framework: "*"
+     auth-ssl: "*"
+  display_name: "${green-framework} ${python-version} ${platform} ${auth-ssl}"
+  tasks: *all-server-versions
+
+# Test CPython 3.4 against MongoDB 2.6-4.2 on Windows with Visual Studio 2010.
+- matrix_name: "tests-windows-vs2010-python-version"
+  matrix_spec:
+    platform: windows-vs2010
+    python-version: &win-vs2010-pythons ["win-vs2010-3.4"]
+    auth-ssl: "*"
+  display_name: "${platform} ${python-version} ${auth-ssl}"
+  tasks:
+    - ".4.2"
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+    - ".3.2"
+    - ".3.0"
+    - ".2.6"
+
+# windows-vs2010 3.4 is unable to dlopen the libmongocrypt ddl built on 2016
+#- matrix_name: "tests-windows-vs2010-python-version-encryption"
+#  matrix_spec:
+#    platform: windows-vs2010
+#    python-version: *win-vs2010-pythons
+#    auth-ssl: "*"
+#    encryption: "*"
+#  display_name: "Encryption ${platform} ${python-version} ${auth-ssl}"
+#  tasks: *encryption-server-versions
+
+- matrix_name: "tests-python-version-requires-openssl-102-plus-test-ssl"
+  matrix_spec:
+    platform: ubuntu-16.04
+    python-version: &openssl-102-plus-pythons ["3.7", "3.8"]
+    auth-ssl: "*"
+  display_name: "${python-version} OpenSSL 1.0.2 ${platform} ${auth-ssl}"
+  tasks:
+     - ".latest"
+     - ".4.2"
+     - ".4.0"
+     - ".3.6"
+     - ".3.4"
+     - ".3.2"
+
+- matrix_name: "tests-python-version-requires-openssl-102-plus-test-encryption"
+  matrix_spec:
+    platform: ubuntu-16.04
+    python-version: *openssl-102-plus-pythons
+    auth-ssl: "noauth-nossl"
+    encryption: "*"
+  display_name: "Encryption ${python-version} ${platform} ${auth-ssl}"
+  tasks: *encryption-server-versions
+
+- matrix_name: "tests-python-version-supports-openssl-110-test-ssl"
+  matrix_spec:
+    platform: debian92
+    python-version: *openssl-102-plus-pythons
+    auth-ssl: "*"
+  display_name: "${python-version} OpenSSL 1.1.0 ${platform} ${auth-ssl}"
+  tasks:
+     - ".latest"
+
+# Test CPython 2.7, 3.5 and 3.6 against MongoDB 2.6-4.2
+# on Windows with the Microsoft Visual C++ Compiler for Python 2.7 or Visual Studio 2015.
+- matrix_name: "tests-windows-vs2015-python-version-27plus"
+  matrix_spec:
+    platform: windows-vs2015
+    python-version: &win-vs2015-pythons ["win-vs2015-2.7", "win-vs2015-3.5", "win-vs2015-3.6", "win-vs2015-3.7"]
+    auth-ssl: "*"
+  display_name: "${platform} ${python-version} ${auth-ssl}"
+  tasks:
+    - ".4.2"
+    - ".4.0"
+    - ".3.6"
+    - ".3.4"
+    - ".3.2"
+    - ".3.0"
+    - ".2.6"
+
+- matrix_name: "tests-windows-vs2015-python-version-encryption"
+  matrix_spec:
+    platform: windows-vs2015
+    python-version: *win-vs2015-pythons
+    auth-ssl: "*"
+    encryption: "*"
+  display_name: "Encryption ${platform} ${python-version} ${auth-ssl}"
+  tasks: *encryption-server-versions
+
+# Test CPython 3.7 against MongoDB >= 4.3 on Windows 2017+.
+- matrix_name: "tests-windows-vs2017"
+  matrix_spec:
+    platform: windows-vs2017
+    python-version: ["win-vs2015-3.7"]
+    auth-ssl: "*"
+  display_name: "${platform} ${python-version} ${auth-ssl}"
+  tasks:
+    - .latest
+
+# Storage engine tests on RHEL 6.2 (x86_64) with Python 2.7.
+- matrix_name: "tests-storage-engines"
+  matrix_spec:
+    platform: rhel62
+    storage-engine: "*"
+    python-version: 2.7
+  display_name: "Storage ${storage-engine} ${python-version} ${platform}"
+  rules:
+    - if:
+        platform: rhel62
+        storage-engine: ["inmemory"]
+        python-version: "*"
+      then:
+        add_tasks:
+          - "test-latest-standalone"
+          - "test-4.2-standalone"
+          - "test-4.0-standalone"
+          - "test-3.6-standalone"
+          - "test-3.4-standalone"
+          - "test-3.2-standalone"
+    - if:
+        # MongoDB 4.2 drops support for MMAPv1
+        platform: rhel62
+        storage-engine: ["mmapv1"]
+        python-version: "*"
+      then:
+        add_tasks:
+          - "test-4.0-standalone"
+          - "test-4.0-replica_set"
+          - "test-3.6-standalone"
+          - "test-3.6-replica_set"
+          - "test-3.4-standalone"
+          - "test-3.2-standalone"
+    - if:
+        # No need to test this on later server versions as it becomes the default
+        platform: rhel62
+        storage-engine: ["wiredtiger"]
+        python-version: "*"
+      then:
+        add_tasks:
+          - "test-3.0-standalone"
+
+# enableTestCommands=0 tests on RHEL 6.2 (x86_64) with Python 2.7.
+- matrix_name: "test-disableTestCommands"
+  matrix_spec:
+    platform: rhel62
+    disableTestCommands: "*"
+    python-version: "2.7"
+  display_name: "Disable test commands ${python-version} ${platform}"
+  tasks:
+     - ".latest"
+
+# setdefaultencoding tests on RHEL 6.2 (x86_64) with Python 2.7.
+- matrix_name: "test-setdefaultencoding"
+  matrix_spec:
+    platform: rhel62
+    setdefaultencoding: "*"
+    python-version: "2.7"
+  display_name: "setdefaultencoding ${python-version} ${platform}"
+  tasks:
+     - "test-latest-standalone"
+
+- matrix_name: "test-linux-enterprise-auth"
+  matrix_spec:
+    platform: rhel62
+    python-version: *rhel62-pythons
+    auth: "auth"
+  display_name: "Enterprise ${auth} ${platform} ${python-version}"
+  tasks:
+     - name: "test-enterprise-auth"
+
+- matrix_name: "tests-windows-vs2010-enterprise-auth"
+  matrix_spec:
+    platform: windows-vs2010
+    python-version: *win-vs2010-pythons
+    auth: "auth"
+  display_name: "Enterprise ${auth} ${platform} ${python-version}"
+  tasks:
+     - name: "test-enterprise-auth"
+
+- matrix_name: "tests-windows-vs2015-enterprise-auth"
+  matrix_spec:
+    platform: windows-vs2015
+    python-version: *win-vs2015-pythons
+    auth: "auth"
+  display_name: "Enterprise ${auth} ${platform} ${python-version}"
+  tasks:
+     - name: "test-enterprise-auth"
+
+- matrix_name: "tests-mod-wsgi"
+  matrix_spec:
+    platform: rhel62
+    python-version: ["2.7", "3.4", "3.6"]
+    mod-wsgi-version: "*"
+  display_name: "${mod-wsgi-version} ${python-version} ${platform}"
+  tasks:
+     - name: "mod-wsgi-standalone"
+     - name: "mod-wsgi-replica-set"
+
+- matrix_name: "mockupdb-tests"
+  matrix_spec:
+    platform: rhel62
+    python-version: 2.7
+  display_name: "MockupDB Tests"
+  tasks:
+     - name: "mockupdb"
+
+- matrix_name: "tests-doctests"
+  matrix_spec:
+    platform: rhel62
+    python-version: ["2.7", "3.4"]
+  display_name: "Doctests ${python-version} ${platform}"
+  tasks:
+     - name: "doctests"
+
+- matrix_name: "cdecimal"
+  matrix_spec:
+    platform: rhel62
+    python-version: 2.7
+  display_name: "cdecimal ${python-version} ${platform}"
+  tasks:
+    - name: "cdecimal"
+
+- name: "no-server"
+  display_name: "No server test"
+  run_on:
+    - rhel62-small
+  tasks:
+    - name: "no-server"
+  expansions:
+    set_xtrace_on: on
+
+- name: "Coverage Report"
+  display_name: "Coverage Report"
+  run_on:
+    - ubuntu1604-test
+  tasks:
+     - name: "coverage-report"
+  expansions:
+    set_xtrace_on: on
+
+- matrix_name: "atlas-connect-pre-279"
+  matrix_spec:
+    platform: rhel70
+  display_name: "Atlas connect Pre-2.7.9 Python ${platform}"
+  tasks:
+    - name: "atlas-connect"
+
+- matrix_name: "atlas-connect"
+  matrix_spec:
+    platform: rhel62
+    python-version: *rhel62-pythons
+  display_name: "Atlas connect ${python-version} ${platform}"
+  tasks:
+    - name: "atlas-connect"
+
+- matrix_name: "atlas-connect-openssl-102-plus"
+  matrix_spec:
+    platform: debian92
+    python-version: *openssl-102-plus-pythons
+  display_name: "Atlas connect ${python-version} ${platform}"
+  tasks:
+    - name: "atlas-connect"
+
+- matrix_name: "ocsp-test"
+  matrix_spec:
+    platform: ubuntu-16.04
+    python-version: ["2.7", "3.4", "3.8", "pypy", "pypy3.5"]
+    auth: "noauth"
+    ssl: "ssl"
+  display_name: "OCSP test ${python-version} ${platform}"
+  tasks:
+    - name: ".ocsp"
+
+      # Platform notes
+      # i386 builds of OpenSSL or Cyrus SASL are not available
+      # Ubuntu16.04 ppc64le is only supported by MongoDB 3.4+
+      # Ubuntu16.04 aarch64 is only supported by MongoDB 3.4+
+      # Ubuntu16.04 s390x is only supported by MongoDB 3.4+
+      # Ubuntu16.04 (x86) only supports MongoDB 3.2+
+      # Debian 8.1 only supports MongoDB 3.4+
+      # SUSE12 s390x is only supported by MongoDB 3.4+
+      # No enterprise build for Archlinux, SSL not available
+      # RHEL 7 only supports 2.6+
+      # RHEL 7.1 ppc64le is only supported by MongoDB 3.2+
+      # RHEL 7.2 s390x is only supported by MongoDB 3.4+
+      # Solaris MongoDB SSL builds are not available
+      # Darwin MongoDB SSL builds are not available for 2.6
+      # SUSE12 x86_64 is only supported by MongoDB 3.2+
+      # vim: set et sw=2 ts=2 :
