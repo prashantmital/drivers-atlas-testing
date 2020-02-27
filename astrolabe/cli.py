@@ -339,9 +339,9 @@ def isready_cluster(ctx, group_name, cluster_name):
     state = ctx.obj.groups[project.id].clusters[cluster_name].get().data.stateName
 
     if state == "IDLE":
-        print("True")
+        click.echo("True")
         exit(0)
-    print("False")
+    click.echo("False", err=True)
     exit(1)
 
 
@@ -353,10 +353,8 @@ def delete_cluster(ctx, group_name, cluster_name):
     """Delete the Atlas Cluster."""
     project = ctx.obj.groups.byName[group_name].get().data
     ctx.obj.groups[project.id].clusters[cluster_name].delete().data
-    print("DONE!")
+    click.echo("DONE!")
 
-
-# @atlas_clusters.command('getlogs')
 
 @cli.group('info')
 def help_topics():

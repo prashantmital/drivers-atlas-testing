@@ -123,36 +123,3 @@ class SingleTestXUnitLogger:
 def _nested_defaultdict():
     """An infinitely nested defaultdict type."""
     return defaultdict(_nested_defaultdict)
-
-
-def _merge_dictionaries(dicts):
-    """Utility method to merge a list of dictionaries.
-    Last observed value prevails."""
-    result = {}
-    for d in dicts:
-        result.update(d)
-    return result
-
-
-class _JsonDotNotationType(click.ParamType):
-    """Custom Click-type for user-friendly JSON input."""
-    def convert(self, value, param, ctx):
-        # Return None and target type without change.
-        if value is None or isinstance(value, dict):
-            return value
-
-        # Parse the input (of type path.to.namespace=value).
-        ns, config_value = value.split("=")
-        ns_path = ns.split(".")
-        return_value = _nested_defaultdict()
-
-        # Construct dictionary from parsed option.
-        pointer = return_value
-        for key in ns_path:
-            if key == ns_path[-1]:
-                pointer[key] = config_value
-            else:
-                pointer = pointer[key]
-
-        # Convert nested defaultdict into vanilla dictionary.
-        return json.loads(json.dumps(return_value))
