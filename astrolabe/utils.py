@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
-import json
 import logging
 import os
 from time import monotonic
@@ -118,8 +116,3 @@ class SingleTestXUnitLogger:
         xml = junitparser.JUnitXml()
         xml.add_testsuite(suite)
         xml.write(xml_path)
-
-
-def _nested_defaultdict():
-    """An infinitely nested defaultdict type."""
-    return defaultdict(_nested_defaultdict)
