@@ -21,7 +21,8 @@ import astrolabe.commands as cmd
 import astrolabe.docgen as docgen
 from atlasclient import AtlasClient
 from atlasclient.configuration import CONFIG_DEFAULTS as CL_DEFAULTS
-from astrolabe.docgen import tabulate_astrolabe_configuration
+from astrolabe.docgen import (
+    tabulate_astrolabe_configuration, tabulate_client_configuration)
 from astrolabe.spec_runner import MultiTestRunner, SingleTestRunner
 from astrolabe.configuration import (
     CLI_OPTION_NAMES as OPTNAMES,
@@ -31,7 +32,7 @@ from astrolabe.configuration import (
 from astrolabe.utils import ClickLogHandler
 
 
-__LOGGER__ = logging.getLogger(__name__)
+__logger__ = logging.getLogger(__name__)
 
 
 # Define CLI options used in multiple commands for easy re-use.
@@ -80,6 +81,12 @@ XUNITOUTPUT_OPTION = click.option(
     '--xunit-output', type=click.STRING, default="xunit-output",
     help='Name of the folder in which to write the XUnit XML files.')
 
+NODELETE_FLAG = click.option(
+    '--no-delete', is_flag=True, default=False,
+    help=('Flag to instructs astrolabe to not delete clusters at the end of '
+          'the test run. Useful when a test will be run multiple times with '
+          'the same cluster name salt.'))
+
 
 @click.group()
 @click.option(OPTNAMES.BASE_URL, envvar=ENVVARS.BASE_URL,
@@ -97,9 +104,9 @@ XUNITOUTPUT_OPTION = click.option(
               help='Time (in s) after which HTTP requests should timeout.')
 @click.option('-v', OPTNAMES.LOG_VERBOSITY, envvar=ENVVARS.LOG_VERBOSITY,
               type=click.Choice(
-                  ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']),
-              default=DEFAULTS.LOG_VERBOSITY, show_default=True,
-              help='Set the logging level.')
+                  ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                  case_sensitive=False), default=DEFAULTS.LOG_VERBOSITY,
+              show_default=True, help='Set the logging level.')
 @click.version_option()
 @click.pass_context
 def cli(ctx, atlas_base_url, atlas_api_username,
@@ -117,11 +124,16 @@ def cli(ctx, atlas_base_url, atlas_api_username,
     ctx.obj = client
 
     # Configure logging.
-    loglevel = getattr(logging, log_level)
-    # noinspection PyArgumentList
+    loglevel = getattr(logging, log_level.upper())
     logging.basicConfig(
         level=loglevel, handlers=[ClickLogHandler()],
         format="%(levelname)s:%(name)s:%(message)s")
+
+    # Log atlasclient config.
+    __logger__.info(tabulate_client_configuration(atlas_base_url, http_timeout))
+
+    # Turn off noisy urllib3 logging.
+    logging.getLogger('urllib3').setLevel(int(loglevel) + 10)
 
 
 @cli.command()
@@ -382,16 +394,17 @@ def spec_tests():
 @POLLINGTIMEOUT_OPTION
 @POLLINGFREQUENCY_OPTION
 @XUNITOUTPUT_OPTION
+@NODELETE_FLAG
 @click.pass_context
 def run_single_test(ctx, spec_test_file, workload_executor,
                     db_username, db_password, org_name, group_name,
                     cluster_name_salt, polling_timeout, polling_frequency,
-                    xunit_output):
+                    xunit_output, no_delete):
     """
     Run one APM test.
     This command runs the test found in the SPEC_TEST_FILE.
     """
-    # Construct test configuration object.
+    # Step-0: construct test configuration object and log configuration.
     config = TestCaseConfiguration(
         organization_name=org_name,
         group_name=group_name,
@@ -401,17 +414,14 @@ def run_single_test(ctx, spec_test_file, workload_executor,
         database_username=db_username,
         database_password=db_password,
         workload_executor=workload_executor)
-
-    # Step-0: print configuration.
-    click.echo(tabulate_astrolabe_configuration(config))
+    __logger__.info(tabulate_astrolabe_configuration(config))
 
     # Step-1: create the Test-Runner.
     runner = SingleTestRunner(client=ctx.obj,
                               test_locator_token=spec_test_file,
                               configuration=config,
-                              xunit_output=xunit_output)
-    click.echo("---------------- Test Plan ---------------- ")
-    click.echo(runner.get_printable_test_plan())
+                              xunit_output=xunit_output,
+                              persist_clusters=no_delete)
 
     # Step-2: run the tests.
     failed = runner.run()
@@ -434,16 +444,17 @@ def run_single_test(ctx, spec_test_file, workload_executor,
 @POLLINGTIMEOUT_OPTION
 @POLLINGFREQUENCY_OPTION
 @XUNITOUTPUT_OPTION
+@NODELETE_FLAG
 @click.pass_context
 def run_headless(ctx, spec_tests_directory, workload_executor, db_username,
                  db_password, org_name, group_name, cluster_name_salt,
-                 polling_timeout, polling_frequency, xunit_output):
+                 polling_timeout, polling_frequency, xunit_output, no_delete):
     """
     Main entry point for running APM tests in headless environments.
     This command runs all tests found in the SPEC_TESTS_DIRECTORY
     sequentially on an Atlas cluster.
     """
-    # Construct test configuration object.
+    # Step-0: construct test configuration object and log configuration.
     config = TestCaseConfiguration(
         organization_name=org_name,
         group_name=group_name,
@@ -453,17 +464,14 @@ def run_headless(ctx, spec_tests_directory, workload_executor, db_username,
         database_username=db_username,
         database_password=db_password,
         workload_executor=workload_executor)
-
-    # Step-0: print configuration.
-    click.echo(tabulate_astrolabe_configuration(config))
+    __logger__.info(tabulate_astrolabe_configuration(config))
 
     # Step-1: create the Test-Runner.
     runner = MultiTestRunner(client=ctx.obj,
                              test_locator_token=spec_tests_directory,
                              configuration=config,
-                             xunit_output=xunit_output)
-    click.echo("---------------- Test Plan ---------------- ")
-    click.echo(runner.get_printable_test_plan())
+                             xunit_output=xunit_output,
+                             persist_clusters=no_delete)
 
     # Step-2: run the tests.
     failed = runner.run()

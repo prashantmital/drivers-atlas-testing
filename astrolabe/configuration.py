@@ -22,7 +22,7 @@ CONFIG_DEFAULTS = JSONObject.from_dict({
     "DB_PASSWORD": "mypassword123",
     "POLLING_TIMEOUT": 600.0,
     "POLLING_FREQUENCY": 1.0,
-    "LOG_VERBOSITY": "CRITICAL"
+    "LOG_VERBOSITY": "INFO"
 })
 
 

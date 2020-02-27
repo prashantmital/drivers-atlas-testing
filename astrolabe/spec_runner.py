@@ -14,6 +14,7 @@
 
 from hashlib import sha256
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -35,6 +36,9 @@ from astrolabe.poller import BooleanCallablePoller
 from astrolabe.utils import (
     assert_subset, cached_property, encode_cdata, SingleTestXUnitLogger,
     Timer)
+
+
+__logger__ = logging.getLogger(__name__)
 
 
 class AtlasTestCase:
@@ -92,6 +96,9 @@ class AtlasTestCase:
         connection_string += urlencode(uri_options)
         return connection_string
 
+    def __repr__(self):
+        return "<AtlasTestCase: {}>".format(self.id)
+
     def is_cluster_state(self, goal_state):
         cluster_info = self.cluster_url.get().data
         return cluster_info.stateName.lower() == goal_state.lower()
@@ -116,7 +123,8 @@ class AtlasTestCase:
         Initialize a cluster with the configuration required by the test
         specification.
         """
-        # Create a cluster of the desired name with the given config.
+        __logger__.info("Initializing cluster {!r}".format(self.cluster_name))
+
         cluster_config = self.spec.maintenancePlan.initial.\
             clusterConfiguration.copy()
         cluster_config["name"] = self.cluster_name
@@ -137,11 +145,12 @@ class AtlasTestCase:
             self.client.groups[self.get_group().id].\
                 clusters[self.cluster_name].processArgs.patch(**process_args)
 
-    def run(self):
+    def run(self, persist_cluster=False):
+        __logger__.info("Running test {!r} on cluster {!r}".format(
+            self.id, self.cluster_name))
+
         # Step-0: sanity-check the cluster configuration.
         self.verify_cluster_configuration_matches("initial")
-
-        print("Running test {} on cluster {}.".format(self.id, self.cluster_name))
 
         # Start the test timer.
         timer = Timer()
@@ -150,6 +159,8 @@ class AtlasTestCase:
         # Step-1: load test data.
         test_data = self.spec.driverWorkload.get('testData')
         if test_data:
+            __logger__.info("Loading test data on cluster {!r}".format(
+                self.cluster_name))
             connection_string = self.get_connection_string()
             client = MongoClient(connection_string, w="majority")
             coll = client.get_database(
@@ -157,15 +168,19 @@ class AtlasTestCase:
                 self.spec.driverWorkload.collection)
             coll.drop()
             coll.insert_many(test_data)
+            __logger__.info(
+                "Successfully loaded test data on cluster {!r}".format(
+                    self.cluster_name))
 
         # Step-2: run driver workload.
+        __logger__.info("Starting workload executor")
         connection_string = self.get_connection_string()
         driver_workload = json.dumps(self.spec.driverWorkload)
         worker_subprocess = subprocess.Popen([
             sys.executable, self.config.workload_executor, connection_string,
             driver_workload], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        print("Workload executor running. PID: {}".format(worker_subprocess.pid))
+        __logger__.info("Started workload executor [PID: {}]".format(
+            worker_subprocess.pid))
 
         # Step-3: begin maintenance routine.
         final_config = self.spec.maintenancePlan.final
@@ -173,43 +188,44 @@ class AtlasTestCase:
         process_args = final_config.processArgs
 
         if not cluster_config and not process_args:
-            raise RuntimeError("invalid maintenance plan.")
+            raise RuntimeError("invalid maintenance plan")
 
         if cluster_config:
+            __logger__.info("Pushing cluster configuration update")
             self.cluster_url.patch(**cluster_config)
 
         if process_args:
+            __logger__.info("Pushing process arguments update")
             self.cluster_url.processArgs.patch(**process_args)
 
         # Sleep before polling to avoid "missing" cluster.stateName change.
         sleep(3)
 
-        print("Waiting for maintenance to complete.")
-
         # Step-4: wait until maintenance completes (cluster is IDLE).
         selector = BooleanCallablePoller(
             frequency=self.config.polling_frequency,
             timeout=self.config.polling_timeout)
+        __logger__.info("Waiting for cluster maintenance to complete")
         selector.poll([self], attribute="is_cluster_state", args=("IDLE",),
                       kwargs={})
         self.verify_cluster_configuration_matches("final")
+        __logger__.info("Cluster maintenance complete")
 
         # Step-5: interrupt driver workload and capture streams
+        __logger__.info("Stopping workload executor [PID: {}]".format(
+            worker_subprocess.pid))
         os.kill(worker_subprocess.pid, self.sigint)
         stdout, stderr = worker_subprocess.communicate()
+        __logger__.info("Stopped workload executor")
 
         # Stop the timer
         timer.stop()
-
-        print("Maintenance is complete.")
-        print(stdout)
-        print("-------------------------")
-        print(stderr)
 
         # Step-6: compute xunit entry.
         junit_test = junitparser.TestCase(self.id)
         junit_test.time = timer.elapsed
         if worker_subprocess.returncode != 0:
+            __logger__.info("FAILED: {!r}".format(self.id))
             self.failed = True
             errmsg = """
             Number of errors: {numErrors}
@@ -221,27 +237,30 @@ class AtlasTestCase:
                     errmsg.format(**err_info))
             except json.JSONDecodeError:
                 junit_test.result = junitparser.Error(encode_cdata(stderr))
+        else:
+            __logger__.info("SUCCEEDED: {!r}".format(self.id))
         junit_test.system_err = encode_cdata(stderr)
         junit_test.system_out = encode_cdata(stdout)
 
-        # TODO
-        # download logs and delete cluster asynchronously
-        # cleanup_queue.put(cluster_name)    # cleanup queue downloads logs and deletes cluster
-        # atlas.Clusters(ctx.obj).delete(group.json()["id"], test_case.cluster_name)
-        # Step-8: make a zipfile with all logs
-        # import shutil
-        # shutil.make_archive(...)
+        # Step 7: download logs asynchronously and delete cluster.
+        # TODO: https://github.com/mongodb-labs/drivers-atlas-testing/issues/4
+        if not persist_cluster:
+            self.cluster_url.delete()
+            __logger__.info("Cluster {!r} marked for deletion.".format(
+                self.cluster_name))
 
         return junit_test
 
 
 class SpecTestRunnerBase:
     """Base class for spec test runners."""
-    def __init__(self, *, client, test_locator_token, configuration, xunit_output):
+    def __init__(self, *, client, test_locator_token, configuration, xunit_output,
+                 persist_clusters):
         self.cases = []
         self.client = client
         self.config = configuration
         self.xunit_logger = SingleTestXUnitLogger(output_directory=xunit_output)
+        self.persist_clusters = persist_clusters
 
         for full_path in self.find_spec_tests(test_locator_token):
             # Step-1: load test specification.
@@ -268,25 +287,39 @@ class SpecTestRunnerBase:
         # Set up Atlas for tests.
         # Step-1: ensure validity of the organization.
         # Note: organizations can only be created by via the web UI.
+        org_name = self.config.organization_name
+        __logger__.info("Verifying organization {!r}".format(org_name))
         org = get_one_organization_by_name(
-            client=self.client,
-            organization_name=self.config.organization_name)
+            client=self.client, organization_name=org_name)
+        __logger__.info("Successfully verified organization {!r}".format(
+            org_name))
 
         # Step-2: check that the project exists or else create it.
+        pro_name = self.config.group_name
+        __logger__.info("Verifying project {!r}".format(pro_name))
         group = ensure_project(
-            client=self.client, group_name=self.config.group_name,
-            organization_id=org.id)
+            client=self.client, group_name=pro_name, organization_id=org.id)
+        __logger__.info("Successfully verified project {!r}".format(pro_name))
 
         # Step-3: create a user under the project.
         # Note: all test operations will be run as this user.
+        uname = self.config.database_username
+        __logger__.info("Verifying user {!r}".format(uname))
         ensure_admin_user(
             client=self.client, group_id=group.id,
-            username=self.config.database_username,
-            password=self.config.database_password)
+            username=uname, password=self.config.database_password)
+        __logger__.info("Successfully verified user {!r}".format(uname))
 
         # Step-4: populate project IP whitelist to allow access from anywhere.
-        ensure_connect_from_anywhere(
-            client=self.client, group_id=group.id)
+        __logger__.info(
+            "Enabling access from anywhere on project {!r}".format(pro_name))
+        ensure_connect_from_anywhere(client=self.client, group_id=group.id)
+        __logger__.info(
+            "Successfully enabled access from anywhere on project {!r}".format(
+                pro_name))
+
+        # Step-5: log test plan.
+        __logger__.info(self.get_printable_test_plan())
 
     @staticmethod
     def find_spec_tests(test_locator_token):
@@ -296,9 +329,10 @@ class SpecTestRunnerBase:
         table_data = []
         for test_case in self.cases:
             table_data.append([test_case.id, test_case.cluster_name])
-        return tabulate(
+        table_txt = "Astrolabe Test Plan\n{}\n"
+        return table_txt.format(tabulate(
             table_data, headers=["Test name", "Atlas cluster name"],
-            showindex="always", tablefmt="fancy_grid")
+            tablefmt="rst"))
 
     def run(self):
         # Step-0: sentinel flag to track failure/success.
@@ -314,12 +348,17 @@ class SpecTestRunnerBase:
             selector = BooleanCallablePoller(
                 frequency=self.config.polling_frequency,
                 timeout=self.config.polling_timeout)
+
             # Select a case whose cluster is ready.
+            __logger__.info("Waiting for a test cluster to become ready")
             active_case = selector.poll(
                 remaining_test_cases, attribute="is_cluster_state",
                 args=("IDLE",), kwargs={})
+            __logger__.info("Test cluster {!r} is ready".format(
+                active_case.cluster_name))
+
             # Run the case.
-            xunit_test = active_case.run()
+            xunit_test = active_case.run(persist_cluster=self.persist_clusters)
             # Write xunit entry for case.
             self.xunit_logger.write_xml(
                 test_case=xunit_test,
@@ -340,6 +379,8 @@ class SingleTestRunner(SpecTestRunnerBase):
         Verify that the given file is a spec test file and return its
         absolute path.
         """
+        __logger__.info("Loading spec test from file {!r}".format(
+            test_locator_token))
         full_path = os.path.realpath(test_locator_token)
         if (os.path.isfile(full_path) and
                 test_locator_token.lower().endswith(('.yml', 'yaml'))):
@@ -350,9 +391,13 @@ class MultiTestRunner(SpecTestRunnerBase):
     """Run all spec test files in the ``test_locator_token`` directory."""
     @staticmethod
     def find_spec_tests(test_locator_token):
+        __logger__.info("Scanning directory {!r} for spec tests".format(
+            test_locator_token))
         for root, dirs, files in os.walk(test_locator_token):
             for file in files:
                 full_path = os.path.join(root, file)
                 if (os.path.isfile(full_path) and
                         file.lower().endswith(('.yml', 'yaml'))):
+                    __logger__.debug("Loading spec test from file {!r}".format(
+                        full_path))
                     yield full_path

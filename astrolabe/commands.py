@@ -12,29 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
 from atlasclient import AtlasApiError
 
 
+__logger__ = logging.getLogger(__name__)
+
+
 def get_one_organization_by_name(*, client, organization_name):
+    """Get the ID of the organization by the given name. Raises
+    AtlasApiError if no organization exists by the given name."""
     all_orgs = client.orgs.get().data
     for org in all_orgs.results:
         if org.name == organization_name:
+            __logger__.debug("Organization details: {}".format(org))
             return org
-    raise AtlasApiError('Resource not found.')
+
+    raise AtlasApiError('Organization {!r} not found.'.format(
+        organization_name))
 
 
 def ensure_project(*, client, group_name, organization_id):
+    """Ensure a project named `group_name` exists and return it. Does not
+    raise an exception if a project by that name already exists."""
     try:
-        return client.groups.post(
+        project = client.groups.post(
             name=group_name, orgId=organization_id).data
     except AtlasApiError as exc:
         if exc.error_code == 'GROUP_ALREADY_EXISTS':
-            return client.groups.byName[group_name].get().data
+            __logger__.debug("Project {!r} already exists".format(group_name))
+            project = client.groups.byName[group_name].get().data
         else:
             raise
+    else:
+        __logger__.debug("Project {!r} successfully created".format(
+            project.name))
+
+    __logger__.debug("Project details: {}".format(project))
+    return project
 
 
 def ensure_admin_user(*, client, group_id, username, password):
+    """Ensure an admin user with the given credentials exists on the project
+    bearing ID `group_id`. Updates credentials and returns if a user bearing
+    name `username` already exists, """
     user_details = {
         "groupId": group_id,
         "databaseName": "admin",
@@ -45,16 +67,25 @@ def ensure_admin_user(*, client, group_id, username, password):
         "password": password}
 
     try:
-        return client.groups[group_id].databaseUsers.post(**user_details).data
+        user = client.groups[group_id].databaseUsers.post(**user_details).data
     except AtlasApiError as exc:
         if exc.error_code == "USER_ALREADY_EXISTS":
+            __logger__.debug("User {!r} already exists".format(username))
             username = user_details.pop("username")
-            return client.groups[group_id].databaseUsers.admin[username].patch(
+            user = client.groups[group_id].databaseUsers.admin[username].patch(
                 **user_details).data
         else:
             raise
+    else:
+        __logger__.debug("User {!r} successfully created".format(username))
+
+    __logger__.debug("User details: {}".format(user))
+    return user
 
 
 def ensure_connect_from_anywhere(*, client, group_id,):
+    """Add the 0.0.0.0/0 CIDR block to the IP whitelist of the specified
+    Atlas project."""
     ip_details_list = [{"cidrBlock": "0.0.0.0/0"}]
-    client.groups[group_id].whitelist.post(json=ip_details_list)
+    resp = client.groups[group_id].whitelist.post(json=ip_details_list).data
+    __logger__.debug("Project whitelist details: {}".format(resp))
