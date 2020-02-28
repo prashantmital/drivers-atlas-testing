@@ -168,9 +168,8 @@ class AtlasTestCase:
                 self.spec.driverWorkload.collection)
             coll.drop()
             coll.insert_many(test_data)
-            LOGGER.info(
-                "Successfully loaded test data on cluster {!r}".format(
-                    self.cluster_name))
+            LOGGER.info("Successfully loaded test data on cluster {!r}".format(
+                self.cluster_name))
 
         # Step-2: run driver workload.
         LOGGER.info("Starting workload executor")
@@ -291,8 +290,7 @@ class SpecTestRunnerBase:
         LOGGER.info("Verifying organization {!r}".format(org_name))
         org = get_one_organization_by_name(
             client=self.client, organization_name=org_name)
-        LOGGER.info("Successfully verified organization {!r}".format(
-            org_name))
+        LOGGER.info("Successfully verified organization {!r}".format(org_name))
 
         # Step-2: check that the project exists or else create it.
         pro_name = self.config.group_name
@@ -311,12 +309,11 @@ class SpecTestRunnerBase:
         LOGGER.info("Successfully verified user {!r}".format(uname))
 
         # Step-4: populate project IP whitelist to allow access from anywhere.
-        LOGGER.info(
-            "Enabling access from anywhere on project {!r}".format(pro_name))
+        LOGGER.info("Enabling access from anywhere on project "
+                    "{!r}".format(pro_name))
         ensure_connect_from_anywhere(client=self.client, group_id=group.id)
-        LOGGER.info(
-            "Successfully enabled access from anywhere on project {!r}".format(
-                pro_name))
+        LOGGER.info("Successfully enabled access from anywhere on project "
+                    "{!r}".format(pro_name))
 
         # Step-5: log test plan.
         LOGGER.info(self.get_printable_test_plan())

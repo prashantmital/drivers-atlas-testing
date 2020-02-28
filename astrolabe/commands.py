@@ -46,8 +46,7 @@ def ensure_project(*, client, group_name, organization_id):
         else:
             raise
     else:
-        LOGGER.debug("Project {!r} successfully created".format(
-            project.name))
+        LOGGER.debug("Project {!r} successfully created".format(project.name))
 
     LOGGER.debug("Project details: {}".format(project))
     return project
