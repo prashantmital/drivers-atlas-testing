@@ -130,10 +130,12 @@ def cli(ctx, atlas_base_url, atlas_api_username,
         format="%(levelname)s:%(name)s:%(message)s")
 
     # Log atlasclient config.
-    __logger__.info(tabulate_client_configuration(atlas_base_url, http_timeout))
+    __logger__.debug(tabulate_client_configuration(
+        atlas_base_url, http_timeout))
 
     # Turn off noisy urllib3 logging.
-    logging.getLogger('urllib3').setLevel(int(loglevel) + 10)
+    if loglevel == logging.DEBUG:
+        logging.getLogger('urllib3').setLevel(logging.INFO)
 
 
 @cli.command()
