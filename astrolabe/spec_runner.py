@@ -177,7 +177,7 @@ class AtlasTestCase:
         connection_string = self.get_connection_string()
         driver_workload = json.dumps(self.spec.driverWorkload)
         worker_subprocess = subprocess.Popen([
-            sys.executable, self.config.workload_executor, connection_string,
+            self.config.workload_executor, connection_string,
             driver_workload], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         __logger__.info("Started workload executor [PID: {}]".format(
             worker_subprocess.pid))
