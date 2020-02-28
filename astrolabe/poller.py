@@ -21,7 +21,7 @@ from astrolabe.exceptions import PollingTimeoutError
 from astrolabe.utils import Timer
 
 
-__logger__ = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 class PollerBase:
@@ -45,12 +45,12 @@ class PollerBase:
         timer.start()
         while timer.elapsed < self.timeout:
             logmsg = "Polling {} [elapsed: {:.2f} seconds]"
-            __logger__.debug(logmsg.format(objects, timer.elapsed))
+            LOGGER.debug(logmsg.format(objects, timer.elapsed))
             for obj in objects:
                 return_value = self._check_ready(obj, attribute, args, kwargs)
                 if return_value:
                     return obj
-            __logger__.debug("Waiting {:.2f} seconds before retrying".format(
+            LOGGER.debug("Waiting {:.2f} seconds before retrying".format(
                 self.interval))
             sleep(self.interval)
         raise PollingTimeoutError

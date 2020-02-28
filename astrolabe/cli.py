@@ -32,7 +32,7 @@ from astrolabe.configuration import (
 from astrolabe.utils import ClickLogHandler
 
 
-__logger__ = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 # Define CLI options used in multiple commands for easy re-use.
@@ -130,7 +130,7 @@ def cli(ctx, atlas_base_url, atlas_api_username,
         format="%(levelname)s:%(name)s:%(message)s")
 
     # Log atlasclient config.
-    __logger__.debug(tabulate_client_configuration(
+    LOGGER.debug(tabulate_client_configuration(
         atlas_base_url, http_timeout))
 
     # Turn off noisy urllib3 logging.
@@ -414,7 +414,7 @@ def run_single_test(ctx, spec_test_file, workload_executor,
         database_username=db_username,
         database_password=db_password,
         workload_executor=workload_executor)
-    __logger__.info(tabulate_astrolabe_configuration(config))
+    LOGGER.info(tabulate_astrolabe_configuration(config))
 
     # Step-1: create the Test-Runner.
     runner = SingleTestRunner(client=ctx.obj,
@@ -464,7 +464,7 @@ def run_headless(ctx, spec_tests_directory, workload_executor, db_username,
         database_username=db_username,
         database_password=db_password,
         workload_executor=workload_executor)
-    __logger__.info(tabulate_astrolabe_configuration(config))
+    LOGGER.info(tabulate_astrolabe_configuration(config))
 
     # Step-1: create the Test-Runner.
     runner = MultiTestRunner(client=ctx.obj,

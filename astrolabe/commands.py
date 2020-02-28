@@ -17,7 +17,7 @@ import logging
 from atlasclient import AtlasApiError
 
 
-__logger__ = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 def get_one_organization_by_name(*, client, organization_name):
@@ -26,7 +26,7 @@ def get_one_organization_by_name(*, client, organization_name):
     all_orgs = client.orgs.get().data
     for org in all_orgs.results:
         if org.name == organization_name:
-            __logger__.debug("Organization details: {}".format(org))
+            LOGGER.debug("Organization details: {}".format(org))
             return org
 
     raise AtlasApiError('Organization {!r} not found.'.format(
@@ -41,15 +41,15 @@ def ensure_project(*, client, group_name, organization_id):
             name=group_name, orgId=organization_id).data
     except AtlasApiError as exc:
         if exc.error_code == 'GROUP_ALREADY_EXISTS':
-            __logger__.debug("Project {!r} already exists".format(group_name))
+            LOGGER.debug("Project {!r} already exists".format(group_name))
             project = client.groups.byName[group_name].get().data
         else:
             raise
     else:
-        __logger__.debug("Project {!r} successfully created".format(
+        LOGGER.debug("Project {!r} successfully created".format(
             project.name))
 
-    __logger__.debug("Project details: {}".format(project))
+    LOGGER.debug("Project details: {}".format(project))
     return project
 
 
@@ -70,16 +70,16 @@ def ensure_admin_user(*, client, group_id, username, password):
         user = client.groups[group_id].databaseUsers.post(**user_details).data
     except AtlasApiError as exc:
         if exc.error_code == "USER_ALREADY_EXISTS":
-            __logger__.debug("User {!r} already exists".format(username))
+            LOGGER.debug("User {!r} already exists".format(username))
             username = user_details.pop("username")
             user = client.groups[group_id].databaseUsers.admin[username].patch(
                 **user_details).data
         else:
             raise
     else:
-        __logger__.debug("User {!r} successfully created".format(username))
+        LOGGER.debug("User {!r} successfully created".format(username))
 
-    __logger__.debug("User details: {}".format(user))
+    LOGGER.debug("User details: {}".format(user))
     return user
 
 
@@ -88,4 +88,4 @@ def ensure_connect_from_anywhere(*, client, group_id,):
     Atlas project."""
     ip_details_list = [{"cidrBlock": "0.0.0.0/0"}]
     resp = client.groups[group_id].whitelist.post(json=ip_details_list).data
-    __logger__.debug("Project whitelist details: {}".format(resp))
+    LOGGER.debug("Project whitelist details: {}".format(resp))
