@@ -30,11 +30,6 @@ functions:
     - command: git.get_project
       params:
         directory: "astrolabe-src"
-    # Clone the Python driver
-#    - modules:
-#        - name: mongo-python-driver
-#          repo: git@github.com:mongodb/mongo-python-driver.git
-#          branch: 3.10.1
 
   "upload test results":
     - command: attach.xunit_results
@@ -72,7 +67,6 @@ functions:
         script: |
           ls -la
 
-
 pre:
   - func: "fetch source"
   - func: "make files executable"
@@ -105,8 +99,6 @@ axes:
         display_name: "Ubuntu 16.04"
         run_on: ubuntu1604-test
         batchtime: 10080  # 7 days
-        variables:
-          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/ubuntu1604/master/latest/libmongocrypt.tar.gz
 
 buildvariants:
 - matrix_name: "tests-python"
