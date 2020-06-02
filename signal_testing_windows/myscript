@@ -2,7 +2,7 @@
 
 trap 'wait $PID; exit $?' INT
 
-python3 myscript.py &
+python myscript.py &
 PID=$!
 
 wait $PID
